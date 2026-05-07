@@ -392,16 +392,19 @@ def maybe_upload_to_drive(week: str, title: str, markdown_content: str) -> str |
     Returns the doc's webViewLink, or None if not configured / on failure.
     """
     folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-    creds_path = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")
-    if not folder_id or not creds_path:
+    creds_value = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")
+    if not folder_id or not creds_value:
         return None
 
     from google.oauth2 import service_account  # noqa: PLC0415
     from googleapiclient.discovery import build  # noqa: PLC0415
     from googleapiclient.http import MediaInMemoryUpload  # noqa: PLC0415
 
-    creds = service_account.Credentials.from_service_account_file(
-        creds_path,
+    from lib.credential import load_credentials_json  # noqa: PLC0415
+
+    creds_info = load_credentials_json(creds_value)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
         scopes=["https://www.googleapis.com/auth/drive.file"],
     )
     service = build("drive", "v3", credentials=creds, cache_discovery=False)

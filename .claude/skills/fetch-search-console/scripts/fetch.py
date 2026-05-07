@@ -31,6 +31,7 @@ from google.oauth2.credentials import Credentials  # noqa: E402
 from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: E402
 from googleapiclient.discovery import build  # noqa: E402
 
+from lib.credential import load_credentials_json  # noqa: E402
 from lib.env import load_dotenv  # noqa: E402
 from lib.storage import get_storage  # noqa: E402
 from lib.week import current_week_id, report_week_id  # noqa: E402
@@ -51,35 +52,57 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_credentials(client_path: Path, token_path: Path, force_reauth: bool) -> Credentials:
-    if force_reauth and token_path.exists():
+def load_credentials(client_value: str, token_value: str, force_reauth: bool) -> Credentials:
+    """Build OAuth credentials from env vars that hold either file paths or inline JSON.
+
+    In local dev the values point at files in ~/.config/cc4m-report/.
+    In the Routine, the values are the JSON content inlined directly.
+    Token persistence (refreshed access_token written back) only applies in the
+    file-path case; in the inline case we just refresh in memory each run.
+    """
+    token_path = _maybe_path(token_value)
+
+    if force_reauth and token_path and token_path.exists():
         print(f"--reauth: removing {token_path}")
         token_path.unlink()
 
-    if token_path.exists():
-        try:
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-        except (ValueError, json.JSONDecodeError) as e:
-            print(f"warning: token file at {token_path} is malformed ({e}); running consent flow", file=sys.stderr)
-            creds = None
-        if creds and creds.valid:
-            return creds
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                _save_token(creds, token_path)
-                return creds
-            except RefreshError as e:
-                _fail_loudly(token_path, e)
+    # Try to load existing token (file or inline)
+    creds: Credentials | None = None
+    try:
+        token_info = load_credentials_json(token_value)
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+        # Token missing or malformed — fall through to consent flow if we have a path.
+        if token_path:
+            print(f"note: token at {token_path} not loadable ({e}); will run consent flow", file=sys.stderr)
+        else:
+            # Inline JSON was supposed to be there. Hard fail rather than try interactive consent.
+            print(f"error: GSC_OAUTH_TOKEN_JSON is invalid ({e})", file=sys.stderr)
+            sys.exit(1)
 
-    # First run, or token missing/corrupt and unrecoverable.
-    if not client_path.exists():
-        print(f"error: GSC_OAUTH_CLIENT_JSON not found at {client_path}", file=sys.stderr)
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            if token_path:
+                _save_token(creds, token_path)
+            return creds
+        except RefreshError as e:
+            _fail_loudly(token_path or "<inline>", e)
+
+    # Need consent flow — only meaningful when we have a file path to write to.
+    if not token_path:
+        print("error: no token loadable and no file path to persist a new one. Re-run locally to mint a token.", file=sys.stderr)
+        sys.exit(1)
+    client_path = _maybe_path(client_value)
+    if not client_path or not client_path.exists():
+        print(f"error: GSC_OAUTH_CLIENT_JSON not loadable as a file ({client_value})", file=sys.stderr)
         sys.exit(1)
 
     print("opening browser for one-time GSC consent…")
     flow = InstalledAppFlow.from_client_secrets_file(str(client_path), SCOPES)
-    login_hint = os.getenv("GSC_OAUTH_LOGIN_HINT")  # avoids multi-account "authuser=N" confusion
+    login_hint = os.getenv("GSC_OAUTH_LOGIN_HINT")
     extra: dict = {"prompt": "consent", "access_type": "offline"}
     if login_hint:
         extra["login_hint"] = login_hint
@@ -87,6 +110,14 @@ def load_credentials(client_path: Path, token_path: Path, force_reauth: bool) ->
     _save_token(creds, token_path)
     print(f"saved refresh token to {token_path}")
     return creds
+
+
+def _maybe_path(value: str) -> Path | None:
+    """Return a Path if `value` looks like a path (not inline JSON), else None."""
+    s = (value or "").strip()
+    if not s or s.startswith("{"):
+        return None
+    return Path(s).expanduser()
 
 
 def _save_token(creds: Credentials, token_path: Path) -> None:
@@ -217,7 +248,7 @@ def main() -> int:
         print("error: GSC_PROPERTY, GSC_OAUTH_CLIENT_JSON, GSC_OAUTH_TOKEN_JSON required", file=sys.stderr)
         return 1
 
-    creds = load_credentials(Path(client_json).expanduser(), Path(token_json).expanduser(), args.reauth)
+    creds = load_credentials(client_json, token_json, args.reauth)
     service = build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
     end = date.today() - timedelta(days=2)  # GSC has ~2 day data lag
