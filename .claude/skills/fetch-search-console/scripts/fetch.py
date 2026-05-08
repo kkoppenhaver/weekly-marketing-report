@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -216,6 +217,65 @@ def aggregate_weekly(
     return final
 
 
+def inspect_url(service, property_url: str, url: str) -> dict | None:
+    """Call GSC URL Inspection API for a single URL. Returns a flattened dict
+    with the fields we care about, or None on per-URL failure."""
+    try:
+        resp = service.urlInspection().index().inspect(body={
+            "inspectionUrl": url,
+            "siteUrl": property_url,
+        }).execute()
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    result = (resp or {}).get("inspectionResult") or {}
+    idx = result.get("indexStatusResult") or {}
+    mob = result.get("mobileUsabilityResult") or {}
+    return {
+        "verdict": idx.get("verdict"),
+        "indexed": idx.get("verdict") in ("PASS", "PARTIAL"),
+        "coverage_state": idx.get("coverageState"),
+        "indexing_state": idx.get("indexingState"),
+        "robots_state": idx.get("robotsTxtState"),
+        "page_fetch_state": idx.get("pageFetchState"),
+        "last_crawled": idx.get("lastCrawlTime"),
+        "google_canonical": idx.get("googleCanonical"),
+        "user_canonical": idx.get("userCanonical"),
+        "crawled_as": idx.get("crawledAs"),
+        "mobile_verdict": mob.get("verdict"),
+        "mobile_issues": [
+            {"type": i.get("issueType"), "severity": i.get("severity"), "message": i.get("message")}
+            for i in (mob.get("issues") or [])
+        ],
+        "inspection_link": result.get("inspectionResultLink"),
+    }
+
+
+def _canonical_url(url: str) -> str:
+    """Trailing-slash form. The site's canonical URL has a trailing slash, and
+    inspecting the non-slash form returns 'Page with redirect' instead of the
+    real indexation status."""
+    if "?" in url or "#" in url:
+        return url  # leave odd URLs alone
+    if url.endswith("/"):
+        return url
+    return url + "/"
+
+
+def inspect_all_urls(service, property_url: str, urls: list[str]) -> dict[str, dict]:
+    """Walk URLs sequentially. Sleeps briefly between calls to stay under quota.
+    Inspections are keyed by the input URL but the API call uses the canonical
+    (trailing-slash) form so results aren't muddled by 'Page with redirect'."""
+    out: dict[str, dict] = {}
+    for i, url in enumerate(urls, start=1):
+        canonical = _canonical_url(url)
+        print(f"  [{i}/{len(urls)}] {canonical}")
+        result = inspect_url(service, property_url, canonical)
+        if result:
+            out[url] = result
+        time.sleep(0.5)
+    return out
+
+
 def top_queries_per_page(rows: list[dict], top_n: int = 10) -> dict[str, list[dict]]:
     """Aggregate dim=['page', 'query'] rows → {page: [top_queries...]}."""
     by_page: dict[str, list[dict]] = defaultdict(list)
@@ -290,6 +350,23 @@ def main() -> int:
             ]
         }
 
+    # URL Inspection: run for every post URL plus the homepage.
+    storage = get_storage()
+    site_url = os.getenv("SITE_URL", "https://claudecodeformarketers.com")
+    indexation: dict[str, dict] = {}
+    manifest_key = f"reports/{week}/posts.json"
+    if storage.exists(manifest_key):
+        manifest = storage.read_json(manifest_key)
+        urls_to_inspect = [site_url.rstrip("/") + "/"]
+        urls_to_inspect.extend(p["url"] for p in manifest["posts"] if not p.get("draft"))
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        urls_to_inspect = [u for u in urls_to_inspect if not (u in seen or seen.add(u))]
+        print(f"\nURL Inspection: {len(urls_to_inspect)} URLs (~{len(urls_to_inspect)*0.5:.0f}s)")
+        indexation = inspect_all_urls(service, property_url, urls_to_inspect)
+    else:
+        print(f"warning: {manifest_key} not found — skipping URL Inspection", file=sys.stderr)
+
     output = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "week": week,
@@ -297,12 +374,13 @@ def main() -> int:
         "property": property_url,
         "by_page": by_page,
         "by_query": by_query,
+        "indexation": indexation,
     }
 
-    storage = get_storage()
     out_key = f"reports/{week}/search-console.json"
     storage.write_json(out_key, output)
-    print(f"\nwrote {out_key}: {len(by_page)} page(s), {len(by_query)} query(ies)")
+    not_indexed = sum(1 for v in indexation.values() if not v.get("indexed"))
+    print(f"\nwrote {out_key}: {len(by_page)} page(s), {len(by_query)} query(ies), {len(indexation)} indexation entries ({not_indexed} not indexed)")
     return 0
 
 

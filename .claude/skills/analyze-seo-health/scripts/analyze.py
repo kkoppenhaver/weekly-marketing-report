@@ -319,6 +319,94 @@ def search_quality_issues(gsc: dict | None) -> list[dict]:
     return out
 
 
+def indexation_issues(gsc: dict | None) -> list[dict]:
+    """Surface unindexed pages, stale crawls, and mobile usability failures from URL Inspection."""
+    if not gsc:
+        return []
+    indexation = gsc.get("indexation") or {}
+    if not indexation:
+        return []
+    out: list[dict] = []
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    stale_threshold = _dt.now(_tz.utc) - _td(days=30)
+
+    for url, info in indexation.items():
+        path = url_to_pathname(url)
+        if "error" in info:
+            out.append(issue(
+                severity="info",
+                category="indexation",
+                page=path,
+                summary=f"URL Inspection failed: {info['error'][:100]}",
+                evidence=info,
+                action="Re-run fetch-search-console; transient API errors are common.",
+                effort="S", impact="S",
+            ))
+            continue
+
+        # Not indexed — the highest-impact signal we can produce.
+        if not info.get("indexed"):
+            coverage = info.get("coverage_state") or "unknown"
+            out.append(issue(
+                severity="critical",
+                category="indexation",
+                page=path,
+                summary=f"Not indexed: {coverage}",
+                evidence={
+                    "verdict": info.get("verdict"),
+                    "coverage_state": coverage,
+                    "last_crawled": info.get("last_crawled"),
+                    "page_fetch_state": info.get("page_fetch_state"),
+                    "google_canonical": info.get("google_canonical"),
+                    "user_canonical": info.get("user_canonical"),
+                    "inspection_link": info.get("inspection_link"),
+                },
+                action=(
+                    "Open the inspection_link in GSC and click 'Request Indexing'. "
+                    "If coverage says 'Crawled - currently not indexed', Google judged the page low quality — review thin content, internal linking, and freshness."
+                ),
+                effort="S", impact="L",
+            ))
+            continue
+
+        # Stale crawl (>30 days)
+        last_crawled = info.get("last_crawled")
+        if last_crawled:
+            try:
+                lc_dt = _dt.fromisoformat(last_crawled.replace("Z", "+00:00"))
+                if lc_dt < stale_threshold:
+                    days = (_dt.now(_tz.utc) - lc_dt).days
+                    out.append(issue(
+                        severity="warning",
+                        category="indexation",
+                        page=path,
+                        summary=f"Last crawled {days} days ago ({last_crawled[:10]})",
+                        evidence={
+                            "last_crawled": last_crawled,
+                            "inspection_link": info.get("inspection_link"),
+                        },
+                        action="Submit for re-indexing via GSC. Refresh the post — adding new content or internal links typically nudges Google to re-crawl.",
+                        effort="S", impact="M",
+                    ))
+            except (ValueError, AttributeError):
+                pass
+
+        # Mobile usability failures
+        if info.get("mobile_verdict") == "FAIL":
+            out.append(issue(
+                severity="warning",
+                category="indexation",
+                page=path,
+                summary="Mobile usability issues",
+                evidence={"mobile_issues": info.get("mobile_issues") or []},
+                action="Review mobile_issues in the snapshot — typically tap targets too close, font too small, or content wider than viewport.",
+                effort="M", impact="M",
+            ))
+
+    return out
+
+
 SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
 IMPACT_RANK = {"L": 0, "M": 1, "S": 2}
 EFFORT_RANK = {"S": 0, "M": 1, "L": 2}
@@ -350,6 +438,7 @@ def main() -> int:
     issues_all.extend(cwv_issues(pagespeed))
     issues_all.extend(on_page_issues(posts_doc))
     issues_all.extend(search_quality_issues(gsc))
+    issues_all.extend(indexation_issues(gsc))
 
     issues_all.sort(key=sort_key)
 

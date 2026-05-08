@@ -48,9 +48,20 @@ def fmt_pct(value: float | None) -> str:
     return f"{value:+.0%}"
 
 
-def headline_line(content_perf: dict | None, opportunities: dict | None = None) -> str:
+def headline_line(
+    content_perf: dict | None,
+    opportunities: dict | None = None,
+    seo_health: dict | None = None,
+) -> str:
     """Pick the highest-signal headline available."""
-    # 1. Big declared-target gap with DFS volume — almost always the most important signal.
+    # 0. Critical SEO issue (e.g., unindexed page) — most urgent, leads everything else.
+    critical = [i for i in (seo_health or {}).get("issues", []) if i.get("severity") == "critical"]
+    if critical:
+        top = critical[0]
+        page = top.get("page", "?")
+        return f"{page}: {top.get('issue', 'critical issue')}"
+
+    # 1. Big declared-target gap with DFS volume.
     gaps = (opportunities or {}).get("declared_target_gaps") or []
     if gaps:
         top = gaps[0]
@@ -74,8 +85,12 @@ def headline_line(content_perf: dict | None, opportunities: dict | None = None) 
     return f"{pv} pageviews"
 
 
-def build_focus_bullets(content_perf: dict | None, opportunities: dict | None = None) -> list[str]:
-    if not content_perf and not opportunities:
+def build_focus_bullets(
+    content_perf: dict | None,
+    opportunities: dict | None = None,
+    seo_health: dict | None = None,
+) -> list[str]:
+    if not content_perf and not opportunities and not seo_health:
         return []
     bullets: list[str] = []
     cp = content_perf or {}
@@ -87,6 +102,17 @@ def build_focus_bullets(content_perf: dict | None, opportunities: dict | None = 
     new_posts = (opportunities or {}).get("new_post_suggestions") or []
     used_queries: set[str] = set()
     used_slugs: set[str] = set()
+
+    # 0. Critical SEO issues lead — usually indexation problems that block ranking.
+    critical_issues = [i for i in (seo_health or {}).get("issues", []) if i.get("severity") == "critical"]
+    if critical_issues:
+        top = critical_issues[0]
+        page = top.get("page", "?")
+        bullets.append(
+            f"FIX: {page} — {top.get('issue', 'critical issue')}. "
+            f"{top.get('recommended_action', '')}"
+        )
+        used_slugs.add(page.split("/")[-1])
 
     # 1. Top declared-target gap — usually the highest-leverage action.
     declared_gap_refresh = next((r for r in refreshes if r.get("primary_signal") == "declared_target_gap"), None)
@@ -142,13 +168,14 @@ def build_email(week: str, storage: Storage) -> tuple[str, str]:
     """Return (subject, body_markdown)."""
     content_perf = safe_load(storage, f"reports/{week}/insights.content-perf.json")
     opportunities = safe_load(storage, f"reports/{week}/insights.opportunities.json")
+    seo_health = safe_load(storage, f"reports/{week}/insights.seo-health.json")
     kit = safe_load(storage, f"reports/{week}/kit.json")
     doc_url = safe_text(storage, f"reports/{week}/doc-url.txt")
 
     week_start, _ = week_bounds(week)
     week_iso_num = int(week.split("-W")[1])
 
-    subject = f"CC4M site report — Week {week_iso_num} — {headline_line(content_perf, opportunities)}"
+    subject = f"CC4M site report — Week {week_iso_num} — {headline_line(content_perf, opportunities, seo_health)}"
 
     h = (content_perf or {}).get("headline", {})
     sub = (kit or {}).get("subscribers", {})
@@ -186,7 +213,7 @@ def build_email(week: str, storage: Storage) -> tuple[str, str]:
         lines.append(f"• Missing this week: {', '.join(missing)} (analyzers degrade gracefully)")
     lines.append("")
 
-    focus = build_focus_bullets(content_perf, opportunities)
+    focus = build_focus_bullets(content_perf, opportunities, seo_health)
     if focus:
         lines.append("Worth a look:")
         for i, bullet in enumerate(focus, start=1):
