@@ -14,12 +14,38 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def bootstrap_ssl_bundle() -> None:
+    """Merge the system CA bundle into certifi's bundle so HTTPS works through
+    a TLS-inspecting proxy. Idempotent — safe to call when run.sh already did this.
+
+    Routine containers commonly have a TLS-inspecting proxy whose root CA is in
+    /etc/ssl/certs/ca-certificates.crt but not in certifi's bundled trust store.
+    Without this merge every external HTTPS call fails with
+    'self-signed certificate in certificate chain'.
+    """
+    try:
+        import certifi  # noqa: PLC0415
+    except ImportError:
+        return  # certifi not installed yet; pip install hasn't run
+    cert_path = Path(certifi.where())
+    system_bundle = Path("/etc/ssl/certs/ca-certificates.crt")
+    if system_bundle.exists():
+        existing = cert_path.read_text() if cert_path.exists() else ""
+        marker = "# === merged system CAs ==="
+        if marker not in existing:
+            cert_path.write_text(existing + f"\n{marker}\n" + system_bundle.read_text())
+            print(f"  bootstrap: appended system CAs to {cert_path}")
+    os.environ["SSL_CERT_FILE"] = str(cert_path)
+    os.environ["REQUESTS_CA_BUNDLE"] = str(cert_path)
 
 # (step_name, relative path to script, list of extra args)
 PIPELINE = [
@@ -61,6 +87,17 @@ def main() -> int:
     extra_common: list[str] = []
     if args.week:
         extra_common += ["--week", args.week]
+
+    # Defensive bootstrap — fixes SSL trust if run.sh wasn't invoked.
+    bootstrap_ssl_bundle()
+
+    # Print env-var diagnostics if the helper is available. Always useful at
+    # the top of a Routine run.
+    check_env_script = ROOT / "scripts" / "check_env.py"
+    if check_env_script.exists():
+        print("━━━ env check ━━━")
+        subprocess.run([sys.executable, str(check_env_script)], cwd=ROOT)
+        print("━━━ env check: complete ━━━\n")
 
     failures: list[str] = []
     for name, rel_path, step_args in PIPELINE:
