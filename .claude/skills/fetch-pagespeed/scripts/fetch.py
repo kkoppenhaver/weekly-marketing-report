@@ -61,22 +61,39 @@ async def fetch_one(
     strategy: str,
     api_key: str,
 ) -> tuple[str, str, dict | None, str | None]:
-    """Return (url, strategy, parsed_result_or_None, error_or_None)."""
+    """Return (url, strategy, parsed_result_or_None, error_or_None).
+
+    PSI's Lighthouse backend regularly returns 500 ("Something went wrong") for
+    individual URLs even when the URL is fine. We retry once on 5xx and on
+    timeouts/connection errors; that recovers most of the ~7% of calls that
+    flake on a typical run. 4xx errors don't retry — those are real config bugs.
+    """
     params = {
         "url": url,
         "strategy": strategy,
         "category": "performance",
         "key": api_key,
     }
-    try:
-        resp = await client.get(PSI_ENDPOINT, params=params, timeout=PER_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return url, strategy, parse_psi(resp.json()), None
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:300]
-        return url, strategy, None, f"HTTP {e.response.status_code}: {body}"
-    except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        return url, strategy, None, f"{type(e).__name__}: {e}"
+    last_error: str | None = None
+    for attempt in range(2):  # original try + 1 retry
+        try:
+            resp = await client.get(PSI_ENDPOINT, params=params, timeout=PER_REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return url, strategy, parse_psi(resp.json()), None
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300]
+            last_error = f"HTTP {e.response.status_code}: {body}"
+            if 500 <= e.response.status_code < 600 and attempt == 0:
+                await asyncio.sleep(3)
+                continue
+            return url, strategy, None, last_error
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt == 0:
+                await asyncio.sleep(3)
+                continue
+            return url, strategy, None, last_error
+    return url, strategy, None, last_error
 
 
 def parse_psi(payload: dict[str, Any]) -> dict[str, Any]:
