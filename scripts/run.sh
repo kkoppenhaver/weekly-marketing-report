@@ -10,7 +10,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "━━━ bootstrap: installing dependencies ━━━"
+echo "━━━ bootstrap: creating venv + installing dependencies ━━━"
+# Routine container ships with a Debian-managed system pip that refuses
+# self-upgrades (PEP 668). Avoid that whole class of problem by creating
+# a project-local venv on every run. The container is fresh each time
+# so no caching is lost.
+python3 -m venv .venv
+source .venv/bin/activate
+
 python -m pip install --quiet --upgrade pip
 # Refresh certifi explicitly. Stale CA bundles cause
 # "self-signed certificate in certificate chain" against Google APIs.
