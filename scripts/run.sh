@@ -24,9 +24,23 @@ python -m pip install --quiet --upgrade pip
 python -m pip install --quiet --upgrade certifi
 python -m pip install --quiet -e .
 
-# Point Python's SSL stack at certifi's bundle. Google's auth libraries
-# don't always pick this up automatically.
+# Build a combined CA bundle that trusts both:
+#   1. Public CAs (from certifi)
+#   2. The Routine container's system CAs (which include any proxy CA the
+#      container's TLS-inspecting proxy has installed via update-ca-certificates)
+#
+# We append the system bundle to certifi's bundle in place. Every Python
+# library that calls certifi.where() — httpx, requests, google-auth — picks
+# up the combined trust set automatically. The venv is fresh each run, so
+# this isn't persistent pollution.
 CERT_PATH="$(python -c 'import certifi; print(certifi.where())')"
+SYSTEM_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+if [ -f "$SYSTEM_BUNDLE" ]; then
+  echo "  appending system CAs ($SYSTEM_BUNDLE) to certifi bundle"
+  cat "$SYSTEM_BUNDLE" >> "$CERT_PATH"
+else
+  echo "  no system CA bundle found at $SYSTEM_BUNDLE; using certifi alone"
+fi
 export SSL_CERT_FILE="$CERT_PATH"
 export REQUESTS_CA_BUNDLE="$CERT_PATH"
 echo "  using CA bundle: $CERT_PATH"
