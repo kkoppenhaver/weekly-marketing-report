@@ -56,7 +56,7 @@ The full env var list:
 | `STORAGE` | Set to `r2` | static |
 | `SITE_URL` | `https://claudecodeformarketers.com` | static |
 | `SITE_REPO` | `kkoppenhaver/claude-code-for-marketers` | static |
-| `SITE_REPO_LOCAL` | Path where the Routine mounts the site repo | from step 1 |
+| `SITE_REPO_LOCAL` | Path where the Routine mounts the site repo (commonly `/home/user/claude-code-for-marketers` — confirm against your Routine's filesystem) | from step 1 |
 | `CONTENT_PATH` | `src/content/blog` | static |
 | `R2_ACCESS_KEY` / `R2_SECRET_KEY` / `R2_ENDPOINT` / `R2_BUCKET` | Cloudflare R2 | dashboard |
 | `GSC_PROPERTY` | `sc-domain:claudecodeformarketers.com` | static |
@@ -77,7 +77,10 @@ The Routine prompt instructs Claude what to do at each tick. Keep it tight:
 ```
 Run the weekly site report. Execute:
 
-    python scripts/run_pipeline.py
+    bash scripts/run.sh
+
+The script bootstraps Python dependencies in the Routine's fresh container,
+then runs the full pipeline.
 
 If the pipeline exits with a non-zero status, report which step(s) failed
 and surface the error output. Do not retry — the cron will run again next
@@ -86,6 +89,13 @@ Sunday and a notification of failure is more useful than a partial recovery.
 If the pipeline succeeds, confirm that the email was sent and link the
 Google Doc URL written to reports/{week}/doc-url.txt in the snapshot store.
 ```
+
+### Why a shell wrapper
+
+The Routine starts each run in a fresh Python environment with no project
+dependencies installed. `scripts/run.sh` runs `pip install -e .` to populate
+them from `pyproject.toml`, then invokes `scripts/run_pipeline.py`. The first
+~60 seconds of every run are dependency install; that's expected.
 
 ## 5. Trigger a manual run
 
