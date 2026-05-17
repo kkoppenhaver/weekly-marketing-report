@@ -21,6 +21,9 @@ dev = [
     "pytest>=8.0.0",
 ]
 
+[tool.setuptools]
+packages = ["lib"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
