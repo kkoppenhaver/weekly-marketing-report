@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT))
@@ -66,6 +68,69 @@ def tag_count(client: httpx.Client, tag_id: str, *, tagged_after: date | None = 
     if "total_count" in payload:
         return int(payload["total_count"])
     return len(payload.get("subscribers", []))
+
+
+def signup_url_pathname(raw: str) -> str | None:
+    """Normalize a SIGNUP_URL value to a pathname comparable with Fathom data.
+
+    Accepts full URLs ("https://claudecodeformarketers.com/foo/") or bare paths ("/foo").
+    Strips query/fragment and trailing slash (root stays '/').
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    path = parsed.path if parsed.scheme else raw.split("?", 1)[0].split("#", 1)[0]
+    if not path:
+        path = "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    return path
+
+
+def fetch_subscribers_by_signup_url(
+    client: httpx.Client, tag_id: str, *, tagged_after: date, tagged_before: date
+) -> tuple[Counter, int, int]:
+    """Page through subscribers tagged in the window; tally SIGNUP_URL custom field.
+
+    Returns (counter of pathname -> count, total_subscribers_seen, missing_signup_url_count).
+    """
+    counts: Counter = Counter()
+    seen = 0
+    missing = 0
+    params: dict = {
+        "per_page": 500,
+        "status": "active",
+        "tagged_after": tagged_after.isoformat(),
+        "tagged_before": (tagged_before + timedelta(days=1)).isoformat(),
+        "include_total_count": "false",
+    }
+    url = f"{API_BASE}/tags/{tag_id}/subscribers"
+    while True:
+        resp = client.get(url, params=params, timeout=30.0)
+        resp.raise_for_status()
+        payload = resp.json()
+        subs = payload.get("subscribers", [])
+        for sub in subs:
+            seen += 1
+            raw = (sub.get("fields") or {}).get("SIGNUP_URL")
+            path = signup_url_pathname(raw) if raw else None
+            if not path:
+                missing += 1
+                continue
+            counts[path] += 1
+        pagination = payload.get("pagination") or {}
+        if not pagination.get("has_next_page"):
+            break
+        after = pagination.get("end_cursor")
+        if not after:
+            break
+        params["after"] = after
+    return counts, seen, missing
 
 
 def weekly_history(client: httpx.Client, tag_id: str, current_week: str, weeks_back: int) -> list[dict]:
@@ -126,6 +191,18 @@ def main() -> int:
         print(f"weekly history (last {WEEKS_BACK} weeks):")
         history = weekly_history(client, primary_tag, week, WEEKS_BACK)
 
+        print(f"signup-url attribution for this week ({week_start} → {week_end}):")
+        signup_counts, seen, missing = fetch_subscribers_by_signup_url(
+            client, primary_tag, tagged_after=week_start, tagged_before=week_end
+        )
+        signup_by_path = [
+            {"pathname": path, "new": count}
+            for path, count in signup_counts.most_common()
+        ]
+        print(f"  scanned {seen} subscribers, {missing} missing SIGNUP_URL")
+        for row in signup_by_path[:5]:
+            print(f"  {row['pathname']}: {row['new']}")
+
         # Per-post attribution: only include posts whose kit_tag_id is genuinely
         # distinct from the primary tag. Posts that explicitly set kitTagId to
         # the primary tag duplicate the audience number with no extra signal.
@@ -163,6 +240,11 @@ def main() -> int:
             "weekly_history": history,
         },
         "by_post": per_post,
+        "signup_urls_this_week": {
+            "subscribers_scanned": seen,
+            "missing_signup_url": missing,
+            "by_pathname": signup_by_path,
+        },
     }
 
     out_key = f"reports/{week}/kit.json"

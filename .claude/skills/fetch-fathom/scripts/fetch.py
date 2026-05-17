@@ -122,6 +122,33 @@ def fetch_event_count(client: httpx.Client, event_id: str, start: date, end: dat
     return int(val)
 
 
+def fetch_event_by_pathname(client: httpx.Client, event_id: str, start: date, end: date) -> list[dict]:
+    """Conversions for an event grouped by the pathname where it fired."""
+    params = {
+        "entity": "event",
+        "entity_id": event_id,
+        "aggregates": "conversions",
+        "field_grouping": "pathname",
+        "date_from": start.isoformat(),
+        "date_to": end.isoformat(),
+        "sort_by": "conversions:desc",
+        "limit": 1000,
+        "timezone": "UTC",
+    }
+    payload = get(client, "/aggregations", params)
+    rows = payload if isinstance(payload, list) else payload.get("data", [])
+    out: list[dict] = []
+    for row in rows:
+        path = row.get("pathname")
+        if not path:
+            continue
+        conv = int(row.get("conversions") or 0)
+        if conv <= 0:
+            continue
+        out.append({"pathname": _normalize_path(path), "conversions": conv})
+    return out
+
+
 def aggregate_to_weeks(rows: list[dict]) -> dict[str, dict[str, dict]]:
     """Convert daily rows → {pathname: {week_id: {pageviews, uniques, ...}}}."""
     out: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(lambda: {
@@ -217,11 +244,16 @@ def main() -> int:
                 continue
             this_week = fetch_event_count(client, ev_id, week_start, week_end)
             last_week = fetch_event_count(client, ev_id, prev_start, prev_end)
+            by_path = fetch_event_by_pathname(client, ev_id, week_start, week_end)
             event_data[name] = {
                 "id": ev_id,
                 "this_week": this_week,
                 "last_week": last_week,
+                "this_week_by_pathname": by_path,
             }
+            if by_path:
+                top = ", ".join(f"{r['pathname']}={r['conversions']}" for r in by_path[:3])
+                print(f"  {name}: this_week={this_week}, top pages: {top}")
 
     by_path_weekly = aggregate_to_weeks(pv_rows)
     known_paths = {url_to_pathname(p["url"]) for p in manifest["posts"]}
