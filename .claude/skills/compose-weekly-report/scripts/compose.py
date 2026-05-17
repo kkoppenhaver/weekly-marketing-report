@@ -202,6 +202,22 @@ def render_content_perf(content_perf: dict | None) -> str:
         parts.append("_No posts with unique Kit tags. Add `kitTagId` to high-intent posts to attribute signups per page._")
     parts.append("")
 
+    top_signup_pages = content_perf.get("top_signup_pages") or []
+    parts.append("### Top signup pages this week\n")
+    if top_signup_pages:
+        parts.append("_Where this week's signups happened. Kit = `SIGNUP_URL` custom field set at submit time; Fathom = tracked event grouped by page._\n")
+        parts.append("| Page | Kit | Fathom | |")
+        parts.append("|---|---:|---:|---|")
+        for row in top_signup_pages:
+            label = row.get("title") or row.get("slug") or row["pathname"]
+            flag = " ⚠️ mismatch" if row.get("disagreement") else ""
+            parts.append(
+                f"| {label} (`{row['pathname']}`) | {row['kit_signups']} | {row['fathom_conversions']} |{flag} |"
+            )
+    else:
+        parts.append("_No signup activity attributable to a page this week. Either no signups, or neither Kit's `SIGNUP_URL` field nor a Fathom event was populated._")
+    parts.append("")
+
     striking = content_perf.get("striking_distance_keywords") or []
     parts.append("### Striking-distance keywords\n")
     if striking:

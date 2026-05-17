@@ -44,6 +44,11 @@ TOP_N_RANKING_DECAY = 5
 SURPRISE_MAX_POSITION = 10.0
 SURPRISE_MIN_IMPRESSIONS = 30
 TOP_N_SURPRISE = 5
+TOP_N_SIGNUP_PAGES = 10
+# Flag rows where Kit and Fathom counts differ by more than this many signups
+# AND by more than this ratio. Tiny absolute diffs on small numbers are noise.
+SIGNUP_DISAGREEMENT_ABS = 3
+SIGNUP_DISAGREEMENT_RATIO = 0.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -328,6 +333,58 @@ def compute_decay(fathom: dict, posts_by_path: dict[str, dict], week: str) -> li
     return candidates[:TOP_N_DECAY]
 
 
+def compute_top_signup_pages(
+    kit: dict | None,
+    fathom: dict | None,
+    posts_by_path: dict[str, dict],
+) -> list[dict]:
+    """Merge Kit's SIGNUP_URL tally with Fathom's event-by-pathname tally.
+
+    Both sources record where a signup event fired. Kit goes through the
+    subscriber's custom field; Fathom counts the tracked event by page.
+    They should roughly agree — `disagreement` flags rows where they don't.
+    """
+    kit_by_path: dict[str, int] = {}
+    if kit:
+        for row in (kit.get("signup_urls_this_week") or {}).get("by_pathname", []):
+            path = row.get("pathname")
+            if path:
+                kit_by_path[path] = int(row.get("new") or 0)
+
+    fathom_by_path: dict[str, int] = {}
+    if fathom:
+        for _name, event in (fathom.get("events") or {}).items():
+            for row in event.get("this_week_by_pathname") or []:
+                path = row.get("pathname")
+                if not path:
+                    continue
+                fathom_by_path[path] = fathom_by_path.get(path, 0) + int(
+                    row.get("conversions") or 0
+                )
+
+    all_paths = set(kit_by_path) | set(fathom_by_path)
+    rows: list[dict] = []
+    for path in all_paths:
+        kit_n = kit_by_path.get(path, 0)
+        fathom_n = fathom_by_path.get(path, 0)
+        post = posts_by_path.get(path)
+        diff = abs(kit_n - fathom_n)
+        denom = max(kit_n, fathom_n, 1)
+        disagreement = diff >= SIGNUP_DISAGREEMENT_ABS and (diff / denom) >= SIGNUP_DISAGREEMENT_RATIO
+        rows.append(
+            {
+                "pathname": path,
+                "slug": post["slug"] if post else None,
+                "title": post["title"] if post else None,
+                "kit_signups": kit_n,
+                "fathom_conversions": fathom_n,
+                "disagreement": disagreement,
+            }
+        )
+    rows.sort(key=lambda r: (max(r["kit_signups"], r["fathom_conversions"]), r["kit_signups"]), reverse=True)
+    return rows[:TOP_N_SIGNUP_PAGES]
+
+
 def compute_signup_attribution(kit: dict | None, posts_by_slug: dict[str, dict]) -> list[dict]:
     if not kit:
         return []
@@ -373,6 +430,7 @@ def main() -> int:
     winners = compute_winners(fathom, posts_by_path, week) if fathom else []
     decay = compute_decay(fathom, posts_by_path, week) if fathom else []
     attribution = compute_signup_attribution(kit, posts_by_slug)
+    top_signup_pages = compute_top_signup_pages(kit, fathom, posts_by_path)
     striking = compute_striking_distance(gsc, posts_by_path) if gsc else []
     ranking_decay = compute_ranking_decay(gsc, posts_by_path) if gsc else []
     surprises = compute_surprise_winners(gsc, posts_by_path) if gsc else []
@@ -391,6 +449,7 @@ def main() -> int:
         "winners_this_week": winners,
         "decaying_posts": decay,
         "signup_attribution": attribution,
+        "top_signup_pages": top_signup_pages,
         "striking_distance_keywords": striking,
         "ranking_decay": ranking_decay,
         "surprise_winners": surprises,
@@ -406,6 +465,7 @@ def main() -> int:
         f"signups {headline['signups_this_week']} (was {headline['signups_last_week']})"
     )
     print(f"  winners: {len(winners)}, decaying: {len(decay)}, attributed posts: {len(attribution)}")
+    print(f"  top signup pages: {len(top_signup_pages)}")
     if gsc:
         print(
             f"  GSC: striking-distance={len(striking)}, ranking-decay={len(ranking_decay)}, "
