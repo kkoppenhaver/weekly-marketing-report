@@ -24,28 +24,60 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def bootstrap_ssl_bundle() -> None:
-    """Merge the system CA bundle into certifi's bundle so HTTPS works through
-    a TLS-inspecting proxy. Idempotent — safe to call when run.sh already did this.
+    """Merge the system CA bundle into every trust store the pipeline touches.
 
     Routine containers commonly have a TLS-inspecting proxy whose root CA is in
-    /etc/ssl/certs/ca-certificates.crt but not in certifi's bundled trust store.
-    Without this merge every external HTTPS call fails with
+    /etc/ssl/certs/ca-certificates.crt but not in any Python library's bundled
+    trust store. Without this merge every external HTTPS call fails with
     'self-signed certificate in certificate chain'.
+
+    Two trust stores need patching because Python libraries don't agree on one:
+
+    1. certifi's bundle (`certifi.where()`) — used by httpx, requests,
+       google-auth's `transport.requests`. Honors `SSL_CERT_FILE` env var.
+    2. httplib2's bundle (`httplib2/cacerts.txt`) — used by
+       google-api-python-client. Does *not* honor any env var; the only way
+       in is to modify the file on disk.
+
+    Patching files on disk (rather than module-level constants) is what makes
+    this work across subprocesses — each fetcher runs in its own Python process
+    and re-imports the libraries, so file-on-disk changes are the only thing
+    that propagates.
+
+    Idempotent via a marker comment — safe to call multiple times (run.sh also
+    does part of this, and this function defensively re-does it).
     """
+    marker = "# === merged system CAs ==="
+    system_bundle = Path("/etc/ssl/certs/ca-certificates.crt")
+    if not system_bundle.exists():
+        print("  bootstrap: no system CA bundle found; skipping merge")
+        return
+    system_text = system_bundle.read_text()
+
+    def merge_into(target: Path, label: str) -> None:
+        existing = target.read_text() if target.exists() else ""
+        if marker in existing:
+            return
+        target.write_text(existing + f"\n{marker}\n" + system_text)
+        print(f"  bootstrap: appended system CAs to {label} ({target})")
+
     try:
         import certifi  # noqa: PLC0415
+        cert_path = Path(certifi.where())
+        merge_into(cert_path, "certifi")
+        os.environ["SSL_CERT_FILE"] = str(cert_path)
+        os.environ["REQUESTS_CA_BUNDLE"] = str(cert_path)
     except ImportError:
-        return  # certifi not installed yet; pip install hasn't run
-    cert_path = Path(certifi.where())
-    system_bundle = Path("/etc/ssl/certs/ca-certificates.crt")
-    if system_bundle.exists():
-        existing = cert_path.read_text() if cert_path.exists() else ""
-        marker = "# === merged system CAs ==="
-        if marker not in existing:
-            cert_path.write_text(existing + f"\n{marker}\n" + system_bundle.read_text())
-            print(f"  bootstrap: appended system CAs to {cert_path}")
-    os.environ["SSL_CERT_FILE"] = str(cert_path)
-    os.environ["REQUESTS_CA_BUNDLE"] = str(cert_path)
+        print("  bootstrap: certifi not installed; skipping certifi merge")
+
+    try:
+        import httplib2  # noqa: PLC0415
+        httplib2_bundle = Path(httplib2.__file__).parent / "cacerts.txt"
+        merge_into(httplib2_bundle, "httplib2")
+    except ImportError:
+        # httplib2 is a transitive dep of google-api-python-client; absent in
+        # very minimal environments. Skip silently if not present.
+        pass
 
 # (step_name, relative path to script, list of extra args)
 PIPELINE = [
